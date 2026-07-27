@@ -1,0 +1,161 @@
+﻿#include "referencePTPathTracer.hlsl"
+
+#pragma max_recursion_depth 1
+
+[shader("miss")]
+void MissOpaque(inout HitInfo payload)
+{
+    payload.hasHit = false;
+}
+
+[shader("miss")]
+void MissShadow(inout HitInfo payload)
+{
+	payload.hasHit = false;
+}
+
+[shader("raygeneration")]
+void RayGen()
+{
+	uint2 LaunchIndex = DispatchRaysIndex().xy;
+	uint2 LaunchDimensions = DispatchRaysDimensions().xy;
+
+	// Initialize random numbers generator
+	RngStateType rngState = initRNG(LaunchIndex, LaunchDimensions, _FrameNumber);
+
+	// Figure out pixel coordinates being raytraced
+	float2 pixel = float2(LaunchIndex);
+	const float2 resolution = float2(LaunchDimensions);
+
+	// Antialiasing (optional)
+	if (_EnableAntiAliasing) {
+		// Add a random offset to the pixel 's screen coordinates .
+		float2 offset = float2(rand(rngState), rand(rngState));
+		pixel += lerp(-0.5.xx, 0.5.xx, offset);
+	}
+
+	pixel = (((pixel + 0.5f) / resolution) * 2.0f - 1.0f);
+
+	// Initialize ray to the primary ray
+	RayDesc ray = generatePrimaryRay(pixel, rngState);
+	HitInfo payload = (HitInfo)0;
+
+	// Initialize path tracing data
+	float3 radiance = float3(0.0f, 0.0f, 0.0f);
+	float3 throughput = float3(1.0f, 1.0f, 1.0f);
+
+	// Start the ray tracing loop
+	for (int bounce = 0; bounce < _MaxBounces; bounce++)
+	{
+		// Trace the ray
+		TraceRay(
+			_SceneBVH,
+			RAY_FLAG_NONE,
+			0xFF,
+			0,
+			1,
+			0,
+			ray,
+			payload);
+
+		// On a miss, load the sky value and break out of the ray tracing loop
+		if (!payload.hasHit) 
+		{
+			radiance += throughput * loadSkyValue(ray.Direction);
+			break;
+		}
+
+		MaterialProperties material = (MaterialProperties)0;
+		material.baseColor = payload.baseColor;
+		material.metalness = payload.metalness;
+		material.emissive = payload.emissive;
+		material.roughness = payload.roughness;
+
+		// Decode normals and flip them towards the incident ray direction (needed for backfacing triangles)
+		float3 geometryNormal;
+		float3 shadingNormal;
+		decodeNormals(payload.encodedNormals, geometryNormal, shadingNormal);
+
+		float3 V = -ray.Direction;
+		if (dot(geometryNormal, V) < 0.0f) geometryNormal = -geometryNormal;
+		if (dot(geometryNormal, shadingNormal) < 0.0f) shadingNormal = -shadingNormal;
+
+		// Account for emissive surfaces
+		radiance += throughput * payload.emissive;
+
+		// Evaluate direct light (next event estimation), start by sampling one light 
+		Light light;
+		float lightWeight;
+		if (sampleLightRIS(rngState, payload.hitPosition, geometryNormal, light, lightWeight))
+		{
+			// Prepare data needed to evaluate the light
+			float3 lightVector;
+			float lightDistance;
+			getLightData(light, payload.hitPosition, lightVector, lightDistance);
+			float3 L = normalize(lightVector);
+
+			// Cast shadow ray towards the selected light
+			if (SHADOW_RAY_IN_RIS || castShadowRay(payload.hitPosition, geometryNormal, L, lightDistance))
+			{
+				// If light is not in shadow, evaluate BRDF and accumulate its contribution into radiance
+				radiance += throughput * evalCombinedBRDF(shadingNormal, L, V, material) * (getLightIntensityAtPoint(light, lightDistance) * lightWeight);
+			}
+		}
+
+		// Terminate loop early on last bounce (we don't need to sample BRDF)
+		if (bounce == _MaxBounces - 1) break;
+
+		// Russian Roulette
+		if (bounce > MIN_BOUNCES) {
+			float rrProbability = min(0.95f, luminance(throughput));
+			if (rrProbability < rand(rngState)) break;
+			else throughput /= rrProbability;
+		}
+
+		// Sample BRDF to generate the next ray
+		// First, figure out whether to sample diffuse or specular BRDF
+		int brdfType;
+		if (payload.metalness == 1.0f && payload.roughness == 0.0f) {
+			// Fast path for mirrors
+			brdfType = SPECULAR_TYPE;
+		} else {
+
+			// Decide whether to sample diffuse or specular BRDF (based on Fresnel term)
+			float brdfProbability = getBrdfProbability(material, V, shadingNormal);
+
+			if (rand(rngState) < brdfProbability) {
+				brdfType = SPECULAR_TYPE;
+				throughput /= brdfProbability;
+			} else {
+				brdfType = DIFFUSE_TYPE;
+				throughput /= (1.0f - brdfProbability);
+			}
+		}
+
+		// Run importance sampling of selected BRDF to generate reflecting ray direction
+		float3 brdfWeight;
+		float2 u = float2(rand(rngState), rand(rngState));
+		if (!evalIndirectCombinedBRDF(u, shadingNormal, geometryNormal, V, material, brdfType, ray.Direction, brdfWeight)) {
+			break; // Ray was eaten by the surface :(
+		}
+
+		// Account for surface properties using the BRDF "weight"
+		throughput *= brdfWeight;
+
+		// Offset a new ray origin from the hitpoint to prevent self-intersections
+		ray.Origin = offsetRay(payload.hitPosition, geometryNormal);
+	}
+
+	// Temporal accumulation
+	float3 previousColor = rw_accumulationBuffer[LaunchIndex].rgb;
+	float3 accumulatedColor = radiance;
+	//改了一下, 原本累加的时间久了精度直接炸了
+	if (_EnableAccumulation && _AccumulatedFrames > 1) 
+	{
+		accumulatedColor = previousColor + (radiance - previousColor) / float(_AccumulatedFrames);
+	}
+
+	rw_accumulationBuffer[LaunchIndex] = float4(accumulatedColor, 1.0f);
+
+	//rw_output[LaunchIndex] = float4(linearToSrgb(accumulatedColor * _ExposureAdjustment), 1.0f);//color banding太严重了, 不用
+}

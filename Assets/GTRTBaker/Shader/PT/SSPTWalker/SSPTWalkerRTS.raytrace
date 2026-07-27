@@ -1,0 +1,24 @@
+﻿#include "SSPTWalkerRayGenLib.hlsl"
+
+#pragma max_recursion_depth 1
+
+
+[shader("miss")]
+void CommonMissShader(inout OpenPBRPayload payload)
+{
+    SSPT_CommonMiss(payload, WorldRayDirection());
+}
+
+[shader("miss")]
+void VolumeMissShader(inout OpenPBRPayload payload)
+{
+    SSPT_VolumeMiss(payload);
+}
+
+[shader("raygeneration")]
+void SSRTWalkerRayGen()
+{
+    uint2 launchIndex = DispatchRaysIndex().xy;
+    uint2 launchDim = DispatchRaysDimensions().xy;
+    SSPT_WalkPixel(launchIndex, launchDim);
+}

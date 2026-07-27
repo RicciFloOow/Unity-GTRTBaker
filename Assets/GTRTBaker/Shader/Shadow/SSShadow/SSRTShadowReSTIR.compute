@@ -1,0 +1,138 @@
+﻿#pragma kernel InitialAndTemporalKernel
+#pragma kernel SpatialAndResolveKernel
+
+#define PI 3.14159265358979323846
+
+#include "../../Lib/BasicNoiseLib.hlsl"
+#include "../../Lib/CommonLib.hlsl"
+#include "../../ReSTIR/ReSTIRValidation.hlsl"
+#include "SSRTShadowReSTIRLib.hlsl"
+#include "SSRTShadowLib.hlsl"
+
+[numthreads(8, 8, 1)]
+void InitialAndTemporalKernel(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 dispatchIdx = dispatchThreadId.xy;
+    if (dispatchIdx.x >= _ScreenWidth || dispatchIdx.y >= _ScreenHeight)
+        return;
+
+    uint pixelIndex = GetPixelIndex(dispatchIdx);
+    uint seed = (pixelIndex * 114514) + (_FrameIndex * 265714);
+
+    float depth = _CamDepthTexture[dispatchIdx].r;
+    float4 materialData = _CamMaterialsTexture[dispatchIdx];
+
+    if (depth <= 1e-8 || materialData.y > 0.5)
+    {
+        rw_TemporalReservoirs[pixelIndex] = InitReservoir();
+        return;
+    }
+
+    float2 uv = (dispatchIdx + 0.5f) / float2(_ScreenWidth, _ScreenHeight);
+    float3 worldPos = GTRT_ReconstructWorldPos(uv, depth, _InvCameraVPMatrix);
+    float3 worldNormal = normalize(_CamNormalsTexture[dispatchIdx].xyz);
+    float3 viewDir = -normalize(worldPos);
+    float specularProb = materialData.x;
+    float roughness = 1.0 - materialData.w;
+
+    int2 topologyID = (int2)_CamTopologyIDTexture[dispatchIdx].xy;
+    SurfaceContext currentSurface = { topologyID.x, topologyID.y };
+
+    SSRTShadowReservoir reservoir = InitReservoir();
+    
+    EmissionSample initialSample = GenerateInitialCandidate(seed);
+    float initialPdf = GetEmissionSamplePDF(initialSample);
+    float initialTarget = EvaluateUnshadowedTarget(initialSample, worldPos, worldNormal, viewDir, roughness, specularProb);
+    float initialWeight = (initialPdf > 0.0) ? (initialTarget / initialPdf) : 0.0;
+    
+    UpdateReservoir(reservoir, initialSample, initialWeight, initialTarget, seed);
+    
+    if (_FrameIndex > 0)
+    {
+        float2 validHistoryUV;
+        bool foundHistory = FindValidHistoryUVIn2x2(
+            uv, depth, worldPos,
+            _HisCamTopologyIDTexture, _HisCamDepthTexture,
+            _HistoryTexSize, currentSurface,
+            validHistoryUV
+        );
+
+        if (foundHistory)
+        {
+            uint2 histPixel = (uint2)(validHistoryUV * _HistoryTexSize.xy);
+            uint histIndex = GetPixelIndex(histPixel);
+            SSRTShadowReservoir historyRes = _HistoryReservoirs[histIndex];
+
+            float historyTargetAtCurrent = EvaluateUnshadowedTarget(historyRes.emiSample, worldPos, worldNormal, viewDir, roughness, specularProb);
+            CombineReservoirs(reservoir, historyRes, historyTargetAtCurrent, seed);
+        }
+    }
+    
+    rw_TemporalReservoirs[pixelIndex] = reservoir;
+}
+
+[numthreads(8, 8, 1)]
+void SpatialAndResolveKernel(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 dispatchIdx = dispatchThreadId.xy;
+    if (dispatchIdx.x >= _ScreenWidth || dispatchIdx.y >= _ScreenHeight)
+        return;
+
+    uint pixelIndex = GetPixelIndex(dispatchIdx);
+    uint seed = (pixelIndex * 123321) + (_FrameIndex * 114514);
+
+    float depth = _CamDepthTexture[dispatchIdx].r;
+    float4 materialData = _CamMaterialsTexture[dispatchIdx];
+    
+    if (depth <= 1e-8 || materialData.y > 0.5)
+    {
+        rw_CurrentReservoirs[pixelIndex] = InitReservoir();
+        rw_RayProposalTex[dispatchIdx] = float4(0, 1, 0, -1.0);
+        rw_ResolveWeightTex[dispatchIdx] = 0.0;
+        return;
+    }
+    
+    float2 uv = (dispatchIdx + 0.5f) / float2(_ScreenWidth, _ScreenHeight);
+    float3 worldPos = GTRT_ReconstructWorldPos(uv, depth, _InvCameraVPMatrix);
+    float3 worldNormal = normalize(_CamNormalsTexture[dispatchIdx].xyz);
+    float3 viewDir = -normalize(worldPos);
+    float specularProb = materialData.x;
+    float roughness = 1.0 - materialData.w;
+
+    int2 topologyID = _CamTopologyIDTexture[dispatchIdx].xy;
+    SurfaceContext currentSurface = { topologyID.x, topologyID.y };
+    
+    SSRTShadowReservoir reservoir = _TemporalReservoirs[pixelIndex];
+    
+    for (uint i = 0; i < _SpatialNeighborCount; ++i)
+    {
+        float2 offset = MapToUnitDisk(float2(pcgHash(seed), pcgHash(seed))) * _SpatialRadius;
+        int2 neighborPixel = (int2)dispatchIdx + (int2)offset;
+
+        if (any(neighborPixel < 0) || neighborPixel.x >= (int)_ScreenWidth || neighborPixel.y >= (int)_ScreenHeight)
+            continue;
+
+        int2 neighborID = _CamTopologyIDTexture[neighborPixel].xy;
+        SurfaceContext neighborSurface = { neighborID.x, neighborID.y };
+            
+        if (!IsValidHistoryPixel(currentSurface, neighborSurface))
+            continue;
+
+        uint neighborIndex = GetPixelIndex((uint2)neighborPixel);
+            
+        SSRTShadowReservoir neighborRes = _TemporalReservoirs[neighborIndex];
+
+        float neighborTargetAtCurrent = EvaluateUnshadowedTarget(neighborRes.emiSample, worldPos, worldNormal, viewDir, roughness, specularProb);
+        CombineReservoirs(reservoir, neighborRes, neighborTargetAtCurrent, seed);
+    }
+    
+    rw_CurrentReservoirs[pixelIndex] = reservoir;
+    
+    float3 rayDir;
+    float rayTMax;
+    bool validRay;
+    GetRayProposal(reservoir, worldPos, rayDir, rayTMax, validRay);
+
+    rw_RayProposalTex[dispatchIdx] = validRay ? float4(rayDir, rayTMax) : float4(0, 1, 0, -1.0);
+    rw_ResolveWeightTex[dispatchIdx] = GetReservoirResolveWeight(reservoir);
+}

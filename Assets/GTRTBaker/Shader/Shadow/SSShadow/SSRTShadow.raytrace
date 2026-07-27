@@ -1,0 +1,164 @@
+﻿//inline的没法做GT的: buffer的数据的绑定没法确定稳不稳, 更别说alpha clip了(unity自带的DXC版本低太多, OMM没法接入), 老老实实DXR1.0
+#define GTRT_RESTIR_NEE
+#define UNITY_DXR
+#define PI 3.14159265358979323846
+#include "SSRTShadowLib.hlsl"
+#include "../../Lib/BasicNoiseLib.hlsl"
+#include "../../Lib/CommonLib.hlsl"
+#include "SSRTShadowReSTIRLib.hlsl"
+
+float3 GetR4GGXDirectionWorld(float3 worldNormal, float3 viewDir, float roughness, uint sampleIndex, float2 pixelScramble)
+{
+    float2 R4Point = GetScrambledR4Sequence(sampleIndex, pixelScramble);
+
+    float a = max(0.001, roughness * roughness);
+    float a2 = a * a;
+
+    float phi = TWO_PI * R4Point.x;
+
+    float cosTheta = sqrt(max(0.0, (1.0 - R4Point.y) / (1.0 + (a2 - 1.0) * R4Point.y)));
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+
+    float3 H_local = float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
+
+    float3 tangent, bitangent;
+    BuildOrthonormalBasis(worldNormal, tangent, bitangent);
+    float3 H_world = normalize(tangent * H_local.x + bitangent * H_local.y + worldNormal * H_local.z);
+
+    return reflect(-viewDir, H_world);
+}
+
+#pragma max_recursion_depth 1
+
+[shader("miss")]
+void MissShader(inout HitInfo payload)
+{
+    payload.hitEmission = 0.0;
+    payload.isRayOcc = false;
+}
+
+[shader("raygeneration")]
+void SSRTShadowRayGen()
+{
+	uint2 dispatchIdx = DispatchRaysIndex().xy;
+    uint2 dispatchDim = DispatchRaysDimensions().xy;
+
+    float radianceOcc = 1.0;
+    float radianceUnocc = 1.0;
+
+    float depth = _CamDepthTexture[dispatchIdx].r;
+    float4 materialData = _CamMaterialsTexture[dispatchIdx];
+
+    if (depth > 1e-8 && materialData.y < 0.5) 
+    {
+        float2 uv = (dispatchIdx + 0.5f) / float2(dispatchDim.x, dispatchDim.y);
+        float4 clipPos = float4(uv * 2.0f - 1.0f, depth, 1.0f);
+        clipPos.y = -clipPos.y;
+        float4 worldPos4 = mul(_InvCameraVPMatrix, clipPos);
+        float3 worldPos = worldPos4.xyz / worldPos4.w;
+
+        float3 worldNormal = normalize(_CamNormalsTexture[dispatchIdx].xyz);
+
+        float3 viewDir = -normalize(worldPos);
+
+#if defined(GTRT_RESTIR_NEE)
+        float4 rayProposal = _RayProposalTex[dispatchIdx];
+        float resolveWeight = _ResolveWeightTex[dispatchIdx];
+        
+        radianceUnocc = resolveWeight;
+        radianceOcc = 0.0;
+
+        if (rayProposal.w > 0.0 && resolveWeight > 0.0)
+        {
+            RayDesc ray;
+            ray.Origin = worldPos + worldNormal * 1e-5f;
+            ray.Direction = rayProposal.xyz;
+            ray.TMin = 1e-5;
+            ray.TMax = rayProposal.w;
+
+            HitInfo payload;
+            payload.hitEmission = 0.0;
+            payload.isRayOcc = true;
+
+            TraceRay(_RTAccStruct, RAY_FLAG_NONE, 0xFF, 0, 1, 0, ray, payload);
+            
+            if (!payload.isRayOcc) 
+            {
+                radianceOcc = resolveWeight;
+            }
+        }
+#else
+        float specularProb = materialData.x;
+        float smoothness = materialData.w;
+        float roughness = 1.0 - smoothness;
+
+        uint pixelSeed = (dispatchIdx.y * dispatchDim.x + dispatchIdx.x) * 114514;
+        float2 pixelScramble = pcgHash2D(pixelSeed);
+
+        float3 rayDir;
+        uint lobeSeed = pixelSeed + _FrameIndex * 6657;
+        float lobeRandom = pcgHash(lobeSeed);
+
+        if (lobeRandom < specularProb)
+        {
+            rayDir = GetR4GGXDirectionWorld(worldNormal, viewDir, roughness, _FrameIndex, pixelScramble);
+        
+            if (dot(rayDir, worldNormal) < 0.0) 
+            {
+                rayDir = reflect(rayDir, worldNormal);
+            }
+        }
+        else
+        {
+            rayDir = GetR4CosineHemisphereDirectionWorld(worldNormal, _FrameIndex, pixelScramble);
+        }
+
+        RayDesc ray;
+        ray.Origin = worldPos + worldNormal * 1e-5f;
+        ray.Direction = rayDir;
+        ray.TMin = 1e-5;
+        ray.TMax = 1e5;
+
+        HitInfo payload;
+        payload.hitEmission = 0.0;
+        payload.isRayOcc = false;
+
+        TraceRay(_RTAccStruct, RAY_FLAG_FORCE_NON_OPAQUE, 0xFF, 0, 1, 0, ray, payload);
+        radianceUnocc = payload.hitEmission;
+
+        radianceOcc = 0.0;
+    
+        if (radianceUnocc > 0.0) 
+        {
+            payload.hitEmission = 0.0;
+            payload.isRayOcc = true;
+        
+            TraceRay(_RTAccStruct, RAY_FLAG_NONE, 0xFF, 0, 1, 0, ray, payload);
+            radianceOcc = payload.hitEmission;
+        }
+#endif
+    }
+    
+    float currentOcc = radianceOcc;
+    float currentUnocc = radianceUnocc;
+
+    if (_FrameIndex > 1)
+    {
+        float lastOcc = rw_OccludedRT[dispatchIdx];
+        float lastUnocc = rw_UnoccludedRT[dispatchIdx];
+        
+        float weight = 1.0f / (float)_FrameIndex;
+        
+        currentOcc = lerp(lastOcc, radianceOcc, weight);
+        currentUnocc = lerp(lastUnocc, radianceUnocc, weight);
+    }
+
+    rw_OccludedRT[dispatchIdx] = currentOcc;
+    rw_UnoccludedRT[dispatchIdx] = currentUnocc;
+
+    float currentShadow = (currentUnocc > 1e-8) ? saturate(currentOcc / currentUnocc) : 0.0;
+    
+    rw_OutputRT[dispatchIdx] = float4(currentShadow.xxx, 1.0);
+    //rw_OutputRT[dispatchIdx] = _ResolveWeightTex[dispatchIdx].xxxx;
+    //rw_OutputRT[dispatchIdx] = _RayProposalTex[dispatchIdx];
+}

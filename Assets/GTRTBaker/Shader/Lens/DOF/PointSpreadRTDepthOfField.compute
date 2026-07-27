@@ -1,0 +1,125 @@
+﻿//虽说是point的, 不过别的网格也是支持的
+#pragma only_renderers d3d11
+#pragma kernel GTPointSpreadDoFKernel
+#pragma use_dxc
+#pragma require inlineraytracing
+
+#include "../../Lib/CommonLib.hlsl"
+#include "LensDepthOfFieldLib.hlsl"
+
+float4x4 _CameraProjMatrix;
+float4x4 _InvCameraViewMatrix;
+uint _FrameIndex;
+float _FocusDistance;
+float _ApertureRadius;
+float4 _SurfaceColor;
+uint _LensMode;//懒得用变体了
+float _AnamorphicSqueeze;
+int _ApertureNumSides;
+float _ApertureAngle;
+
+Texture2D<float> _ApertureMaskTex;
+
+RaytracingAccelerationStructure _RTAccStruct;
+
+RWTexture2D<float4> rw_OutputNoDoF;
+RWTexture2D<float4> rw_OutputDoF;
+
+float3 TraceScene(RayDesc ray)
+{
+    uint flags = RAY_FLAG_CULL_BACK_FACING_TRIANGLES | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_FORCE_OPAQUE;
+    RayQuery<RAY_FLAG_CULL_BACK_FACING_TRIANGLES | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_FORCE_OPAQUE> query; 
+    
+    query.TraceRayInline(_RTAccStruct, flags, 0xFF, ray);
+    query.Proceed();
+    
+    if (query.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+    {
+        return _SurfaceColor.xyz;
+    }
+    
+    return 0;
+}
+
+[numthreads(8, 4, 1)]
+void GTPointSpreadDoFKernel (uint3 id : SV_DispatchThreadID)
+{
+    uint2 launchDim;
+    rw_OutputNoDoF.GetDimensions(launchDim.x, launchDim.y);
+    
+    if (any(id.xy >= launchDim))
+        return;
+        
+    float2 pixelCenter = id.xy + 0.5f;
+    float2 ndc = pixelCenter / float2(launchDim.x, launchDim.y) * 2.0f - 1.0f;
+    
+    float aspect = _CameraProjMatrix._m11 / _CameraProjMatrix._m00;
+    float tanHalfFovY = 1.0f / _CameraProjMatrix._m11;
+
+    float3 viewDirection = float3(ndc.x * aspect * tanHalfFovY, -ndc.y * tanHalfFovY, 1.0f);
+    
+    float3 pinholeDir = normalize(mul((float3x3)_InvCameraViewMatrix, viewDirection));
+    float3 cameraRight = float3(_InvCameraViewMatrix._m00, _InvCameraViewMatrix._m10, _InvCameraViewMatrix._m20);
+    float3 cameraUp = float3(_InvCameraViewMatrix._m01, _InvCameraViewMatrix._m11, _InvCameraViewMatrix._m21);
+    float3 cameraForward = float3(_InvCameraViewMatrix._m02, _InvCameraViewMatrix._m12, _InvCameraViewMatrix._m22);
+    
+    float3 cameraOrigin = 0;
+    
+    RayDesc rayNoDoF;
+    rayNoDoF.Origin = cameraOrigin;
+    rayNoDoF.Direction = pinholeDir;
+    rayNoDoF.TMin = 1e-5;
+    rayNoDoF.TMax = 1e6;
+    
+    uint pixelSeed = (id.y * launchDim.x + id.x) * 114514;
+    
+    float2 pixelScramble = pcgHash2D(pixelSeed);
+
+    float2 xi = GetScrambledR4Sequence(_FrameIndex, pixelScramble);
+    
+    float apertureWeight = 1.0;
+    float2 lensOffset = 0.0;
+    
+    if (_LensMode == 1)
+    {
+        lensOffset = SampleApertureDiamond(xi, _ApertureRadius, apertureWeight);
+    }
+    else if (_LensMode == 2)
+    {
+        lensOffset = SampleAperturePolygon(xi, _ApertureRadius, _ApertureNumSides, _ApertureAngle, apertureWeight);
+    }
+    else if (_LensMode == 3)
+    {
+        lensOffset = SampleApertureMask(xi, _ApertureRadius, _ApertureMaskTex, sampler_LinearRepeat, apertureWeight);
+    }
+    else 
+    {
+        lensOffset = SampleApertureCircle(xi, _ApertureRadius, apertureWeight);
+    }
+    
+    RayDesc rayDoF = GenerateThinLensRayDesc(
+        cameraOrigin, pinholeDir, 
+        cameraForward, cameraRight, cameraUp, 
+        _FocusDistance, lensOffset, _AnamorphicSqueeze
+    );
+    
+    float3 colorNoDoF = TraceScene(rayNoDoF);
+    float3 currentRadianceDoF = TraceScene(rayDoF) * apertureWeight;
+    float currentWeightDoF = apertureWeight;
+    
+    if (_FrameIndex > 1)
+    {
+        float3 historyNoDoF = rw_OutputNoDoF[id.xy].xyz;
+        float4 historyDoF   = rw_OutputDoF[id.xy];
+        
+        float blendWeight = 1.0f / (float)_FrameIndex; 
+        
+        colorNoDoF = lerp(historyNoDoF, colorNoDoF, blendWeight); 
+        
+        currentRadianceDoF = lerp(historyDoF.xyz, currentRadianceDoF, blendWeight); 
+        currentWeightDoF   = lerp(historyDoF.w, currentWeightDoF, blendWeight);
+    }
+    
+    rw_OutputNoDoF[id.xy] = float4(colorNoDoF, 1.0);
+    rw_OutputDoF[id.xy]   = float4(currentRadianceDoF, currentWeightDoF);
+}
